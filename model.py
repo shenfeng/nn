@@ -1,11 +1,18 @@
-import math
-import inspect
+import logging
+import os
 from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from typing import Optional, Tuple
+
+
+class Dotdict(dict):
+    """dot.notation access to dictionary attributes"""
+    __getattr__ = dict.get
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
 
 
 @dataclass
@@ -17,7 +24,7 @@ class ModelConfig:
     # dtype: torch.dtype = torch.float32
     dtype: torch.dtype = torch.bfloat16
     eval_iters: int = 5
-    max_iters: int = 995000
+    max_steps: int = 995000
     n_layer: int = 8
     n_embd: int = 64
     n_head: int = 4
@@ -220,8 +227,8 @@ class Transformer(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False, dtype=config.dtype)
 
         if config.rotary:
-            self.freqs_cis = precompute_freqs_cis(config.n_embd // config.n_head, config.block_size)
-            print('using rotary position embedding')
+            self.freqs_cis = precompute_freqs_cis(config.n_embd // config.n_head, config.block_size).to(config.device)
+            logging.info('using rotary position embedding')
         else:
             self.freqs_cis = None
             self.wpe = nn.Embedding(config.block_size, config.n_embd, dtype=config.dtype)
@@ -232,23 +239,25 @@ class Transformer(nn.Module):
 
         n_params = sum(p.numel() for p in self.parameters())
         device = torch.cuda.get_device_name() if torch.cuda.is_available() else ''
-        print("number of parameters: %.4fM" % (n_params / 1e6,), device)
+        logging.info("number of parameters: %.4fM %s" % (n_params / 1e6, device))
 
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         # assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, t)
 
         tok_emb = self.wte(idx)  # token embeddings of shape (b, t, n_embd)
         if self.freqs_cis is None:
+            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, t)
             pos_emb = self.wpe(pos)  # position embeddings of shape (1, t, n_embd)
             x = tok_emb + pos_emb
         else:
             x = tok_emb
+            _bsz, seqlen = idx.shape
+            freqs_cis = self.freqs_cis[:seqlen]
 
         for block in self.h:
-            x = block(x, self.freqs_cis)
+            x = block(x, freqs_cis)
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
@@ -290,3 +299,27 @@ def generate(model, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k
         idx = torch.cat((idx, idx_next), dim=1)
     model.train()
     return idx
+
+
+save_path = 'models'
+
+
+def get_save_path():
+    try:
+        os.mkdir(save_path)
+    except Exception as e:
+        pass
+
+    for i in range(1000):
+        out_path = 'models/%05d.pt' % i
+        if not os.path.exists(out_path):
+            return out_path
+
+
+def load_path(model):
+    if os.path.exists(save_path):
+        p = sorted(os.listdir(save_path))[-1]
+        model.load_state_dict(torch.load('%s/%s' % (save_path, p)))
+        logging.info(f"loading parameters from {p}")
+    else:
+        logging.warning("error loading already trained")

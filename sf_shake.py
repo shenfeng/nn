@@ -60,7 +60,7 @@ def train_net():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
-    for iter in range(config.max_iters):
+    for iter in range(config.max_steps):
 
         for g in optimizer.param_groups:
             if iter < 10 or iter > 500:
@@ -69,7 +69,7 @@ def train_net():
                 g['lr'] = 0.001
 
         # every once in a while evaluate the loss on train and val sets
-        if iter % config.eval_interval == 0 or iter == config.max_iters - 1:
+        if iter % config.eval_interval == 0 or iter == config.max_steps - 1:
             losses = estimate_loss(model)
             print(f"{time.time():.2f} step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
