@@ -33,6 +33,10 @@ class ModelConfig:
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     learning_rate: float = 1e-3
     rotary: bool = True
+    # https://arxiv.org/pdf/2002.05202.pdf
+    # https://github.com/facebookresearch/llama/blob/main/llama/model.py
+    silu: bool = False
+    bert: bool = False
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -155,6 +159,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.is_causal = False if config.bert else True
 
     def forward(self, x, freqs_cis):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
@@ -174,7 +179,7 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         # efficient attention using Flash Attention CUDA kernels
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
-                                           dropout_p=self.dropout if self.training else 0, is_causal=True)
+                                           dropout_p=self.dropout if self.training else 0, is_causal=self.is_causal)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
@@ -199,6 +204,25 @@ class MLP(nn.Module):
         return x
 
 
+class FeedForward(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        dim = config.n_embd
+        multiple_of = 64
+        hidden_dim = dim * 4
+        hidden_dim = int(2 * hidden_dim / 3)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False, dtype=config.dtype)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False, dtype=config.dtype)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False, dtype=config.dtype)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.dropout(x)
+
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -206,7 +230,7 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias, config=config)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias, config=config)
-        self.mlp = MLP(config)
+        self.mlp = FeedForward(config) if config.silu else MLP(config)
 
     def forward(self, x, freqs_cis=None):
         x = x + self.attn(self.ln_1(x), freqs_cis)
@@ -251,6 +275,7 @@ class Transformer(nn.Module):
             pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, t)
             pos_emb = self.wpe(pos)  # position embeddings of shape (1, t, n_embd)
             x = tok_emb + pos_emb
+            freqs_cis = None
         else:
             x = tok_emb
             _bsz, seqlen = idx.shape
@@ -265,6 +290,7 @@ class Transformer(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=0)
 
         return logits, loss
 
